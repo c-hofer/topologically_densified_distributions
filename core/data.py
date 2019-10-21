@@ -7,7 +7,7 @@ import pickle
 
 from sklearn.model_selection import StratifiedShuffleSplit
 from torch.utils.data.dataset import Subset, TensorDataset
-from torchvision.datasets import CIFAR10, CIFAR100, SVHN
+from torchvision.datasets import CIFAR10, CIFAR100, SVHN, MNIST
 from .ds_util import Transformer
 from pathlib import Path
 
@@ -68,6 +68,11 @@ DS_PATH_CFG = {
         (SVHN, {'root': DATA_ROOT / 'SVHN', 'split': 'train'}),
     'SVHN_test':
         (SVHN, {'root': DATA_ROOT / 'SVHN', 'split': 'test'}),
+    'MNIST_train':
+        (MNIST, {'root': DATA_ROOT / 'mnist', 'train' : True, 'download': True}),
+    'MNIST_test':
+        (MNIST, {'root': DATA_ROOT / 'mnist', 'train' : False, 'download' : True})
+
 }
 
 SPLIT_INDICES_PTH = Path(Path(__file__).parent) / 'data_train_indices.pickle'
@@ -76,9 +81,10 @@ ds_factory = DatasetFactory(DS_PATH_CFG)
 
 
 DS_SPLIT_CFG = {
-    'cifar10_train': [100, 500, 1000, 2000, 4000],
-    'cifar100_train': [100, 500, 1000, 2000, 4000],
-    'SVHN_train': [100, 500, 1000, 2000, 4000]
+    'cifar10_train': [100, 250, 500, 1000, 2000, 4000],
+    'cifar100_train': [100, 250, 500, 1000, 2000, 4000],
+    'SVHN_train': [100, 250, 500, 1000, 2000, 4000],
+    'MNIST_train': [100, 250, 500, 1000, 2000, 4000]
 }
 DS_SPLIT_CFG_NUM_SPLITS = 20
 
