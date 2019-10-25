@@ -66,7 +66,7 @@ def aug_standard(to_tensor_fn):
         RandomTranslateWithReflect(4),
         transforms.RandomHorizontalFlip(),
         to_tensor_fn,
-        GaussianNoise(scale=0.15),
+        # GaussianNoise(scale=0.15),
     ])
 
 
@@ -218,14 +218,21 @@ def experiment_blue_print(
         w_top_loss_rampup_start=None,
         w_top_loss_rampup_end=None,
         top_scale=None,
-        weight_decay=None,
+        weight_decay_feat_ext=None,
+        weight_decay_cls=None,
         pers_type=None,
         compute_persistence=None,
+        track_model=None,
         tag=''):
 
     args = dict(locals())
     print(args)
-    assert all(((v is not None) for k, v in args.items()))
+    if not all(((v is not None) for k, v in args.items())):
+        s = ', '.join((k for k, v in args.items() if v is None))
+        raise AssertionError("Some kwargs are None: {}!".format(s))
+
+    if w_top_loss > 0 and not compute_persistence:
+        raise AssertionError('w_top_loss > 0 and compute_persistence == False')
 
     exp_id = get_experiment_id(tag)
     output_dir = Path(output_root_dir) / exp_id
@@ -276,17 +283,26 @@ def experiment_blue_print(
         model = model_factory(model_name, ds_stats['num_classes'])
         model = model.to(DEVICE)
 
-        opt = torch.optim.SGD(model.parameters(),
-                              weight_decay=weight_decay,
-                              lr=lr_init,
-                              momentum=0.9,
-                              nesterov=True)
+        opt = torch.optim.SGD(
+            [
+                {'params': model.feat_ext.parameters(), 'weight_decay': weight_decay_feat_ext},
+                {'params': model.cls.parameters(),      'weight_decay': weight_decay_cls}
+            ],
+            lr=lr_init,
+            momentum=0.9,
+            nesterov=True)
 
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt,
             T_max=num_epochs,
             eta_min=0,
             last_epoch=-1)
+
+        # scheduler = CosineAnnealingLRFlatEnd(
+        #     opt,
+        #     T_max=num_epochs//2,
+        #     eta_min=0.0001
+        # )
 
         dl_train = DataLoader(
             DS_TRAIN_AUGMENTED,
@@ -331,7 +347,7 @@ def experiment_blue_print(
 
                 if compute_persistence:
                     for i in range(batch_size):
-                        z_sample = z[i*n:(i+1)*n, :].contiguous()
+                        z_sample = z[i*n: (i+1)*n, :].contiguous()
                         lt = pers_fn(z_sample, 0, 0)[0][0][:, 1]
 
                         logger.log_value('batch_lt', lt)
@@ -340,7 +356,10 @@ def experiment_blue_print(
 
                 l = l_cls + w_top_loss * l_top * w_top_rampup(epoch_i)
 
-                logger.log_value('lr', scheduler.get_lr()[0])
+                # COLORS
+                # cls_w = model.cls[0].weight
+                # if cls_w.norm() > 1.:
+                #    l = l + 0.1*cls_w.norm()
 
                 opt.zero_grad()
                 l.backward()
@@ -349,6 +368,9 @@ def experiment_blue_print(
                 epoch_loss += l.item()
                 logger.log_value('batch_cls_loss', l_cls)
                 logger.log_value('batch_top_loss', l_top)
+                logger.log_value('lr', scheduler.get_lr()[0])
+                logger.log_value(
+                    'cls_norm', model.cls[0].weight.data.view(-1).norm())
 
             scheduler.step()
 
@@ -368,8 +390,14 @@ def experiment_blue_print(
                 logger.log_value('acc_test', acc_test)
                 mb_comment += " | acc. test {:.2f} ".format(acc_test)
 
+                logger.log_value('epoch_i', epoch_i)
+
                 mb.first_bar.comment = mb_comment
 
             logger.write_logged_values_to_disk()
+
+            if track_model:
+                logger.write_model_to_disk('model_epoch_{}'.format(epoch_i),
+                                           model)
 
         logger.write_model_to_disk('model', model)
