@@ -227,7 +227,8 @@ def experiment_blue_print(
         lr_init=None,
         w_top_loss=None,
         top_scale=None,
-        weight_decay=None,
+        weight_decay_cls=None,
+        weight_decay_feat_ext=None, 
         normalize_gradient=None,
         pers_type=None,
         compute_persistence=None,
@@ -292,12 +293,16 @@ def experiment_blue_print(
 
         model = model_factory(model_name, ds_stats['num_classes'])
         model = model.to(DEVICE)
-
+        print(model)
+            
         opt = torch.optim.SGD(
-            model.parameters(),
+            [
+                {'params': model.feat_ext.parameters(
+                ), 'weight_decay': weight_decay_feat_ext},
+                {'params': model.cls.parameters(), 'weight_decay': weight_decay_cls}
+            ],
             lr=lr_init,
             momentum=0.9,
-            weight_decay=weight_decay,
             nesterov=True)
 
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -352,20 +357,26 @@ def experiment_blue_print(
                 l.backward()
 
                 # gradient norm and normalization aa
-                norm_p = 0
-                for p in model.parameters():
-                    norm_p += p.grad.data.abs().sum()
+                grad_vec_abs = torch.cat([p.grad.data.view(-1) for p in model.parameters()], dim=0).abs()
 
-                if norm_p > 0 and normalize_gradient:
+                grad_norm = grad_vec_abs.pow(2).sum().sqrt().item()
+
+                if grad_norm > 0 and normalize_gradient:
                     for p in model.parameters():
-                        p.grad.data /= norm_p
+                        p.grad.data /= grad_norm
 
                 opt.step()
 
                 epoch_loss += l.item()
                 logger.log_value('batch_cls_loss', l_cls)
                 logger.log_value('batch_top_loss', l_top)
-                logger.log_value('batch_grad_norm', norm_p)
+
+                logger.log_value('batch_grad_norm', grad_norm)
+                logger.log_value('batch_grad_abs_max', grad_vec_abs.max())
+                logger.log_value('batch_grad_abs_min', grad_vec_abs.min())
+                logger.log_value('batch_grad_abs_mean', grad_vec_abs.mean())
+                logger.log_value('batch_grad_abs_std', grad_vec_abs.std())
+
                 logger.log_value('lr', scheduler.get_lr()[0])
                 logger.log_value(
                     'cls_norm', model.cls[0].weight.data.view(-1).norm())
