@@ -230,7 +230,7 @@ class CNN13Augment(nn.Module):
         return self.cls(z), z
 
 
-class CNN13Alternative(nn.Module):
+class CNN13TestStuff(nn.Module):
     """
     Alternative CNN13 model.
     """
@@ -245,58 +245,56 @@ class CNN13Alternative(nn.Module):
         def weight_norm(module):
             return module
 
-        self.activation = activation
+        self.activation = nn.SELU
 
         self.feat_ext = nn.Sequential(
             weight_norm(nn.Conv2d(3, 128, 3, padding=1)),
-            batchnorm(128),
+            # batchnorm(128),
             activation,
             weight_norm(nn.Conv2d(128, 128, 3, padding=1)),
-            batchnorm(128),
+            # batchnorm(128),
             activation,
             weight_norm(nn.Conv2d(128, 128, 3, padding=1)),
-            batchnorm(128),
+            # batchnorm(128),
             activation,
             nn.MaxPool2d(2, stride=2, padding=0),
             nn.Dropout(0.5),
             #
             weight_norm(nn.Conv2d(128, 256, 3, padding=1)),
-            batchnorm(256),
+            # batchnorm(256),
             activation,
             weight_norm(nn.Conv2d(256, 256, 3, padding=1)),
-            batchnorm(256),
+            # batchnorm(256),
             activation,
             weight_norm(nn.Conv2d(256, 256, 3, padding=1)),
-            batchnorm(256),
+            # batchnorm(256),
             activation,
             nn.MaxPool2d(2, stride=2, padding=0),
             nn.Dropout(0.5),
             #
             weight_norm(nn.Conv2d(256, 512, 3, padding=0)),
-            batchnorm(512),
+            # batchnorm(512),
             activation,
             weight_norm(nn.Conv2d(512, 256, 1, padding=0)),
-            batchnorm(256),
+            # batchnorm(256),
             activation,
             weight_norm(nn.Conv2d(256, 128, 1, padding=0)),
-            batchnorm(128),
+            # batchnorm(128),
             activation,
             nn.AvgPool2d(6, stride=2, padding=0),
             mynn.LinearView()
         )
 
         self.cls = nn.Sequential(
-            nn.Linear(128, 128),
-            nn.BatchNorm1d(128),
-            self.activation,
-            nn.Linear(128, num_classes))
+            nn.Linear(128, num_classes),
+            nn.BatchNorm1d(num_classes))
 
     def forward(self, x, debug=False):
         z = self.feat_ext(x)
         return self.cls(z), z
 
 
-def cnn13_feat_ext(activation, batchnorm, bn_affine):
+def cnn13_feat_ext(activation, batchnorm, bn_affine, latent_dim=None):
     return nn.Sequential(
         nn.Conv2d(3, 128, 3, padding=1),
         batchnorm(128, affine=bn_affine),
@@ -332,14 +330,17 @@ def cnn13_feat_ext(activation, batchnorm, bn_affine):
         batchnorm(128, affine=bn_affine),
         activation,
         nn.AvgPool2d(6, stride=2, padding=0),
-        mynn.LinearView()
+        mynn.LinearView(),
+        Identity() if latent_dim is None else 
+            nn.Sequential(
+                nn.Linear(128, latent_dim),                 
+                nn.BatchNorm1d(latent_dim),
+                # activation 
+                )
     )
 
 
-class CNN13(nn.Module):
-    """
-    Original CNN13 model from Mean Teacher paper (without weight_norm)
-    """
+class CNN13LowLatent(nn.Module):
 
     def __init__(
             self,
@@ -352,13 +353,50 @@ class CNN13(nn.Module):
 
         self.activation = activation
 
-        self.feat_ext = cnn13_feat_ext(
+        tmp = cnn13_feat_ext(
             activation=activation,
             batchnorm=batchnorm,
             bn_affine=self.use_affine)
 
+        self.feat_ext = nn.Sequential(
+            tmp, nn.Linear(128, 16), nn.BatchNorm1d(16))
+
         self.cls = nn.Sequential(
-            nn.Linear(128, num_classes, bias=True))
+            nn.Linear(16, num_classes, bias=True))
+
+    def forward(self, x, debug=False):
+        z = self.feat_ext(x)
+        return self.cls(z), z
+
+
+class CNN13(nn.Module):
+    """
+    Original CNN13 model from Mean Teacher paper (without weight_norm)
+    """
+
+    def __init__(
+            self,
+            num_classes=10,
+            activation=nn.LeakyReLU(0.1),
+            batchnorm=nn.BatchNorm2d,
+            latent_dim=None):
+        super().__init__()
+
+        self.use_affine = True
+        self.latent_dim = latent_dim
+
+        self.activation = activation
+
+        self.feat_ext = cnn13_feat_ext(
+            activation=activation,
+            batchnorm=batchnorm,
+            bn_affine=self.use_affine,
+            latent_dim=latent_dim)
+
+        self.cls = nn.Sequential(
+            nn.Linear(128 if latent_dim is None else latent_dim,
+                      num_classes, bias=True)
+        )
 
     def forward(self, x, debug=False):
         z = self.feat_ext(x)
@@ -410,15 +448,7 @@ class CNN13MultipleLatent(nn.Module):
 
 
 class Identity(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        return x
-
-
-class Identity(nn.Module):
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         super().__init__()
 
     def forward(self, x):
