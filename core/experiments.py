@@ -7,6 +7,8 @@ import torch.nn as nn
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.tensorboard import SummaryWriter
+from jacobian import JacobianReg
+
 
 from collections import defaultdict
 from pathlib import Path
@@ -20,8 +22,9 @@ from chofer_torchex.utils.boiler_plate import apply_model, argmax_and_accuracy
 from chofer_torchex.utils.logging import \
     convert_value_to_built_in_type as convert
 from chofer_torchex.utils.data.ds_operations import ds_random_subset
+from core.logger_reader import LoggerReader
 
-
+import core.statreg
 import core.models as models
 import core.pershom as pershom
 from .ds_util import *
@@ -31,6 +34,7 @@ from .data import ds_factory, ds_factory_stratified_shuffle_split
 
 from .autoaugment import AutoAugment, RandomAutoAugment, FullyRandomAutoAugment, Cutout
 from .augment import Augment
+
 
 DEVICE = 'cuda'
 
@@ -66,6 +70,15 @@ def aug_standard(to_tensor_fn):
     return transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
+        to_tensor_fn,
+    ])
+
+
+def aug_standard_cutout(to_tensor_fn):
+    return transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        Cutout(),
         to_tensor_fn,
     ])
 
@@ -111,6 +124,7 @@ def no_aug(to_tensor_fn):
 def AugmentingTransform(id, to_tensor_fn):
     d = {
         'standard': aug_standard,
+        'standard_cutout': aug_standard_cutout,
         'aug_auto': aug_auto,
         'random_aug_auto': random_aug_auto,
         'full_random_aug_auto': full_random_aug_auto,
@@ -210,6 +224,45 @@ class ExperimentLogger():
         torch.save(model, self._current_write_dir / (key + '.pth'))
 
 
+def setup_data_for_training(
+    ds_train_original,
+    ds_test_original,
+    ds_normalization,
+    type_augmentation,
+    num_augmentations,
+    num_intra_samples,
+    batch_size,
+):
+
+    t = [transforms.ToTensor()]
+    ds_stats = ds_statistics(ds_train_original)
+    if ds_normalization:
+        t += [transforms.Normalize(
+            ds_stats['channel_mean'],
+            ds_stats['channel_std'])]
+    to_tensor = transforms.Compose(t)
+
+    augmenting_transform = AugmentingTransform(type_augmentation, to_tensor)
+    DS_TRAIN = Transformer(ds_train_original, transform=to_tensor)
+    DS_TRAIN_AUGMENTED = RepeatedAugmentation(
+        ds_train_original, augmenting_transform, num_augmentations)
+    DS_TRAIN_AUGMENTED = IntraLabelMultiDraw(
+        DS_TRAIN_AUGMENTED, num_intra_samples)
+    DS_TEST = Transformer(ds_test_original, transform=to_tensor)
+
+    dl_train = DataLoader(
+        DS_TRAIN_AUGMENTED,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=False,
+        collate_fn=collate_fn,
+        num_workers=0)
+
+    num_classes = ds_stats['num_classes']
+
+    return dl_train, DS_TRAIN, DS_TEST, num_classes
+
+
 def experiment_blue_print(
         output_root_dir=None,
         cv_run_num=None,
@@ -218,7 +271,7 @@ def experiment_blue_print(
         ds_normalization=None,
         num_train_samples=None,
         num_augmentations=None,
-        typ_augmentation=None,
+        type_augmentation=None,
         num_intra_samples=None,
         model_name=None,
         batch_size=None,
@@ -270,26 +323,21 @@ def experiment_blue_print(
     """
     for run_i, DS_TRAIN_ORIGINAL in enumerate(DS_TRAIN_ORIGINAL_SPLITS):
 
-        t = [transforms.ToTensor()]
-        ds_stats = ds_statistics(DS_TRAIN_ORIGINAL)
-        if ds_normalization:
-            t += [transforms.Normalize(
-                ds_stats['channel_mean'],
-                ds_stats['channel_std'])]
-        to_tensor = transforms.Compose(t)
-
-        augmenting_transform = AugmentingTransform(typ_augmentation, to_tensor)
-        DS_TRAIN = Transformer(DS_TRAIN_ORIGINAL, transform=to_tensor)
-        DS_TRAIN_AUGMENTED = RepeatedAugmentation(
-            DS_TRAIN_ORIGINAL, augmenting_transform, num_augmentations)
-        DS_TRAIN_AUGMENTED = IntraLabelMultiDraw(
-            DS_TRAIN_AUGMENTED, num_intra_samples)
-        DS_TEST = Transformer(DS_TEST_ORIGINAL, transform=to_tensor)
         assert len(DS_TRAIN_ORIGINAL) == num_train_samples
 
         logger.new_run()
 
-        model = model_factory(model_name, ds_stats['num_classes'])
+        dl_train, DS_TRAIN, DS_TEST, num_classes = setup_data_for_training(
+            ds_train_original=DS_TRAIN_ORIGINAL,
+            ds_test_original=DS_TEST_ORIGINAL,
+            ds_normalization=ds_normalization,
+            type_augmentation=type_augmentation,
+            num_augmentations=num_augmentations,
+            num_intra_samples=num_intra_samples,
+            batch_size=batch_size
+        )
+
+        model = model_factory(model_name, num_classes)
         model = model.to(DEVICE)
         print(model)
 
@@ -308,14 +356,6 @@ def experiment_blue_print(
             T_max=num_epochs,
             eta_min=0,
             last_epoch=-1)
-
-        dl_train = DataLoader(
-            DS_TRAIN_AUGMENTED,
-            batch_size=batch_size,
-            shuffle=True,
-            drop_last=False,
-            collate_fn=collate_fn,
-            num_workers=0)
 
         mb = master_bar(range(num_epochs))
         mb_comment = ''
@@ -349,7 +389,386 @@ def experiment_blue_print(
                         l_top = l_top + (lt-top_scale).abs().sum()
                     l_top = l_top / float(batch_size)
 
-                 l = l_cls + w_top_loss * l_top
+                l = l_cls + w_top_loss * l_top
+
+                opt.zero_grad()
+                l.backward()
+
+                # gradient norm and normalization aa
+                grad_vec_abs = torch.cat(
+                    [p.grad.data.view(-1) for p in model.parameters()], dim=0).abs()
+
+                grad_norm = grad_vec_abs.pow(2).sum().sqrt().item()
+
+                if grad_norm > 0 and normalize_gradient:
+                    for p in model.parameters():
+                        p.grad.data /= grad_norm
+
+                opt.step()
+
+                epoch_loss += l.item()
+                logger.log_value('batch_cls_loss', l_cls)
+                logger.log_value('batch_top_loss', l_top)
+
+                logger.log_value('batch_grad_norm', grad_norm)
+                logger.log_value('batch_grad_abs_max', grad_vec_abs.max())
+                logger.log_value('batch_grad_abs_min', grad_vec_abs.min())
+                logger.log_value('batch_grad_abs_mean', grad_vec_abs.mean())
+                logger.log_value('batch_grad_abs_std', grad_vec_abs.std())
+
+                logger.log_value('lr', scheduler.get_lr()[0])
+                logger.log_value(
+                    'cls_norm', model.cls[0].weight.data.view(-1).norm())
+
+            scheduler.step()
+
+            mb_comment = "Last loss: {:.2f} {:.4f} ".format(
+                epoch_loss,
+                w_top_loss)
+
+            if track_accuracy:
+
+                X, Y = apply_model(model, DS_TRAIN, device=DEVICE)
+                acc_train = argmax_and_accuracy(X, Y)
+                logger.log_value('acc_train', acc_train)
+                mb_comment += " | acc. train {:.2f} ".format(acc_train)
+
+                # TODO - comment out - just for VANILLA testing
+                acc_test = -1
+                if epoch_i == num_epochs-1:
+                    X, Y = apply_model(model, DS_TEST, device=DEVICE)
+                    acc_test = argmax_and_accuracy(X, Y)
+                logger.log_value('acc_test', acc_test)
+                mb_comment += " | acc. test {:.2f} ".format(acc_test)
+
+                logger.log_value('epoch_i', epoch_i)
+
+                mb.first_bar.comment = mb_comment
+
+            logger.write_logged_values_to_disk()
+
+            if track_model:
+                logger.write_model_to_disk('model_epoch_{}'.format(epoch_i),
+                                           model)
+
+        logger.write_model_to_disk('model', model)
+
+
+"""
+Blueprint for Jacobian regularization.
+"""
+
+
+def experiment_jacobian(
+        output_root_dir=None,
+        cv_run_num=None,
+        ds_train_name=None,
+        ds_test_name=None,
+        ds_normalization=None,
+        num_train_samples=None,
+        num_augmentations=None,
+        type_augmentation=None,
+        num_intra_samples=None,
+        model_name=None,
+        batch_size=None,
+        num_epochs=None,
+        cls_loss_fn=None,
+        lr_init=None,
+        w_top_loss=None,
+        top_scale=None,
+        weight_decay_cls=None,
+        weight_decay_feat_ext=None,
+        normalize_gradient=None,
+        pers_type=None,
+        compute_persistence=None,
+        track_model=None,
+        lambda_JR=None,
+        tag=''):
+
+    args = dict(locals())
+    print(args)
+    if not all(((v is not None) for k, v in args.items())):
+        s = ', '.join((k for k, v in args.items() if v is None))
+        raise AssertionError("Some kwargs are None: {}!".format(s))
+
+    if w_top_loss > 0 and not compute_persistence:
+        raise AssertionError('w_top_loss > 0 and compute_persistence == False')
+
+    exp_id = get_experiment_id(tag)
+    output_dir = Path(output_root_dir) / exp_id
+    output_dir.mkdir()
+
+    logger = ExperimentLogger(output_dir, args)
+
+    track_accuracy = True
+
+    """
+    Get the splits for the training data.
+    """
+    DS_TRAIN_ORIGINAL_SPLITS = ds_factory_stratified_shuffle_split(
+        ds_train_name, num_train_samples)
+    DS_TEST_ORIGINAL = ds_factory(ds_test_name)
+    assert len(DS_TRAIN_ORIGINAL_SPLITS) >= cv_run_num
+    DS_TRAIN_ORIGINAL_SPLITS = DS_TRAIN_ORIGINAL_SPLITS[:cv_run_num]
+
+    pers_fn = persistence_fn_factory(args['pers_type'])
+    cls_loss_fn = cls_loss_fn_factory(args['cls_loss_fn'])
+
+    """
+    Run over the dataset splits; the splits are fixed for each number of
+    training samples (500,1000,4000, etc.)
+    """
+    for run_i, DS_TRAIN_ORIGINAL in enumerate(DS_TRAIN_ORIGINAL_SPLITS):
+
+        assert len(DS_TRAIN_ORIGINAL) == num_train_samples
+
+        logger.new_run()
+
+        dl_train, DS_TRAIN, DS_TEST, num_classes = setup_data_for_training(
+            ds_train_original=DS_TRAIN_ORIGINAL,
+            ds_test_original=DS_TEST_ORIGINAL,
+            ds_normalization=ds_normalization,
+            type_augmentation=type_augmentation,
+            num_augmentations=num_augmentations,
+            num_intra_samples=num_intra_samples,
+            batch_size=batch_size
+        )
+
+        model = model_factory(model_name, num_classes)
+        model = model.to(DEVICE)
+        print(model)
+
+        opt = torch.optim.SGD(
+            [
+                {'params': model.feat_ext.parameters(
+                ), 'weight_decay': weight_decay_feat_ext},
+                {'params': model.cls.parameters(), 'weight_decay': weight_decay_cls}
+            ],
+            lr=lr_init,
+            momentum=0.9,
+            nesterov=True)
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt,
+            T_max=num_epochs,
+            eta_min=0,
+            last_epoch=-1)
+
+        mb = master_bar(range(num_epochs))
+        mb_comment = ''
+
+        # Jacobian regularizer
+        regJR = JacobianReg(n=1)
+
+        for epoch_i in mb:
+
+            model.train()
+            epoch_loss = 0
+
+            L = len(dl_train)-1
+            for b_i, ((batch_x, batch_y), _) in enumerate(zip(dl_train, progress_bar(range(L), parent=mb))):
+
+                n = batch_x[0].size(0)
+                assert n == num_intra_samples*num_augmentations
+                assert all(((x.size(0) == n) for x in batch_x))
+
+                x, y = torch.cat(batch_x, dim=0), torch.cat(batch_y, dim=0)
+                x, y = x.to(DEVICE), y.to(DEVICE)
+                x.requires_grad = True
+
+                y_hat, z = model(x)
+                l_cls = cls_loss_fn(y_hat, y)
+
+                l_top = torch.tensor(0.0).to(DEVICE)
+
+                if compute_persistence:
+                    for i in range(batch_size):
+                        z_sample = z[i*n: (i+1)*n, :].contiguous()
+                        lt = pers_fn(z_sample)[0][0][:, 1]
+
+                        logger.log_value('batch_lt', lt)
+                        l_top = l_top + (lt-top_scale).abs().sum()
+                    l_top = l_top / float(batch_size)
+
+                loss_JR = regJR(x, y_hat)
+                l = l_cls + w_top_loss * l_top + lambda_JR*loss_JR
+
+                opt.zero_grad()
+                l.backward()
+                opt.step()
+
+                epoch_loss += l.item()
+                logger.log_value('batch_cls_loss', l_cls)
+                logger.log_value('batch_top_loss', l_top)
+                logger.log_value('lr', scheduler.get_lr()[0])
+                logger.log_value(
+                    'cls_norm', model.cls[0].weight.data.view(-1).norm())
+
+            scheduler.step()
+
+            mb_comment = "Last loss: {:.2f} {:.4f} ".format(
+                epoch_loss,
+                w_top_loss)
+
+            if track_accuracy:
+
+                X, Y = apply_model(model, DS_TRAIN, device=DEVICE)
+                acc_train = argmax_and_accuracy(X, Y)
+                logger.log_value('acc_train', acc_train)
+                mb_comment += " | acc. train {:.2f} ".format(acc_train)
+
+                acc_test = -1
+                if epoch_i == num_epochs-1:
+                    X, Y = apply_model(model, DS_TEST, device=DEVICE)
+                    acc_test = argmax_and_accuracy(X, Y)
+
+                logger.log_value('acc_test', acc_test)
+                mb_comment += " | acc. test {:.2f} ".format(acc_test)
+
+                logger.log_value('epoch_i', epoch_i)
+
+                mb.first_bar.comment = mb_comment
+
+            logger.write_logged_values_to_disk()
+
+            if track_model:
+                logger.write_model_to_disk('model_epoch_{}'.format(epoch_i),
+                                           model)
+
+        logger.write_model_to_disk('model', model)
+
+
+"""Blueprint for random labels"""
+
+
+def experiment_blue_print_random(
+        output_root_dir=None,
+        cv_run_num=None,
+        ds_train_name=None,
+        ds_test_name=None,
+        ds_normalization=None,
+        num_train_samples=None,
+        num_augmentations=None,
+        type_augmentation=None,
+        num_intra_samples=None,
+        model_name=None,
+        batch_size=None,
+        num_epochs=None,
+        cls_loss_fn=None,
+        lr_init=None,
+        w_top_loss=None,
+        top_scale=None,
+        weight_decay_cls=None,
+        weight_decay_feat_ext=None,
+        normalize_gradient=None,
+        pers_type=None,
+        compute_persistence=None,
+        track_model=None,
+        tag=''):
+
+    args = dict(locals())
+    print(args)
+    if not all(((v is not None) for k, v in args.items())):
+        s = ', '.join((k for k, v in args.items() if v is None))
+        raise AssertionError("Some kwargs are None: {}!".format(s))
+
+    if w_top_loss > 0 and not compute_persistence:
+        raise AssertionError('w_top_loss > 0 and compute_persistence == False')
+
+    exp_id = get_experiment_id(tag)
+    output_dir = Path(output_root_dir) / exp_id
+    output_dir.mkdir()
+
+    logger = ExperimentLogger(output_dir, args)
+
+    track_accuracy = True
+
+    """
+    Get the splits for the training data.
+    """
+    DS_TRAIN_ORIGINAL_SPLITS = ds_factory_stratified_shuffle_split(
+        ds_train_name, num_train_samples)
+    DS_TEST_ORIGINAL = ds_factory(ds_test_name)
+    assert len(DS_TRAIN_ORIGINAL_SPLITS) >= cv_run_num
+    DS_TRAIN_ORIGINAL_SPLITS = DS_TRAIN_ORIGINAL_SPLITS[:cv_run_num]
+
+    pers_fn = persistence_fn_factory(args['pers_type'])
+    cls_loss_fn = cls_loss_fn_factory(args['cls_loss_fn'])
+
+    """
+    Run over the dataset splits; the splits are fixed for each number of
+    training samples (500,1000,4000, etc.)
+    """
+    for run_i, DS_TRAIN_ORIGINAL in enumerate(DS_TRAIN_ORIGINAL_SPLITS):
+
+        assert len(DS_TRAIN_ORIGINAL) == num_train_samples
+
+        logger.new_run()
+
+        dl_train, DS_TRAIN, DS_TEST, num_classes = setup_data_for_training(
+            # make sure we have randomized training labels
+            ds_train_original=RandomLabeledDataset(DS_TRAIN_ORIGINAL),
+            ds_test_original=DS_TEST_ORIGINAL,
+            ds_normalization=ds_normalization,
+            type_augmentation=type_augmentation,
+            num_augmentations=num_augmentations,
+            num_intra_samples=num_intra_samples,
+            batch_size=batch_size
+        )
+
+        model = model_factory(model_name, num_classes)
+        model = model.to(DEVICE)
+        print(model)
+
+        opt = torch.optim.SGD(
+            [
+                {'params': model.feat_ext.parameters(
+                ), 'weight_decay': weight_decay_feat_ext},
+                {'params': model.cls.parameters(), 'weight_decay': weight_decay_cls}
+            ],
+            lr=lr_init,
+            momentum=0.9,
+            nesterov=True)
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt,
+            T_max=num_epochs,
+            eta_min=0,
+            last_epoch=-1)
+
+        mb = master_bar(range(num_epochs))
+        mb_comment = ''
+
+        for epoch_i in mb:
+
+            model.train()
+            epoch_loss = 0
+
+            L = len(dl_train)-1
+            for b_i, ((batch_x, batch_y), _) in enumerate(zip(dl_train, progress_bar(range(L), parent=mb))):
+
+                n = batch_x[0].size(0)
+                assert n == num_intra_samples*num_augmentations
+                assert all(((x.size(0) == n) for x in batch_x))
+
+                x, y = torch.cat(batch_x, dim=0), torch.cat(batch_y, dim=0)
+                x, y = x.to(DEVICE), y.to(DEVICE)
+
+                y_hat, z = model(x)
+                l_cls = cls_loss_fn(y_hat, y)
+
+                l_top = torch.tensor(0.0).to(DEVICE)
+
+                if compute_persistence:
+                    for i in range(batch_size):
+                        z_sample = z[i*n: (i+1)*n, :].contiguous()
+                        lt = pers_fn(z_sample)[0][0][:, 1]
+
+                        logger.log_value('batch_lt', lt)
+                        l_top = l_top + (lt-top_scale).abs().sum()
+                    l_top = l_top / float(batch_size)
+
+                l = l_cls + w_top_loss * l_top
 
                 opt.zero_grad()
                 l.backward()
@@ -395,6 +814,316 @@ def experiment_blue_print(
 
                 X, Y = apply_model(model, DS_TEST, device=DEVICE)
                 acc_test = argmax_and_accuracy(X, Y)
+                logger.log_value('acc_test', acc_test)
+                mb_comment += " | acc. test {:.2f} ".format(acc_test)
+
+                logger.log_value('epoch_i', epoch_i)
+
+                mb.first_bar.comment = mb_comment
+
+            logger.write_logged_values_to_disk()
+
+            if track_model:
+                logger.write_model_to_disk('model_epoch_{}'.format(epoch_i),
+                                           model)
+
+        logger.write_model_to_disk('model', model)
+
+
+"""Blueprint for classifier retraining"""
+
+
+def experiment_blue_print_retrain(
+        output_root_dir=None,
+        cv_run_num=None,
+        ds_train_name=None,
+        ds_test_name=None,
+        ds_normalization=None,
+        num_train_samples=None,
+        num_augmentations=None,
+        type_augmentation=None,
+        num_intra_samples=None,
+        batch_size=None,
+        num_epochs=None,
+        cls_loss_fn=None,
+        lr_init=None,
+        weight_decay_cls=None,
+        track_model=None,
+        model_path=None,
+        tag=''):
+
+    args = dict(locals())
+    print(args)
+    if not all(((v is not None) for k, v in args.items())):
+        s = ', '.join((k for k, v in args.items() if v is None))
+        raise AssertionError("Some kwargs are None: {}!".format(s))
+
+    exp_id = get_experiment_id(tag)
+    output_dir = Path(output_root_dir) / exp_id
+    output_dir.mkdir()
+
+    logger = ExperimentLogger(output_dir, args)
+
+    # fetch model
+    reader = LoggerReader(model_path)
+
+    track_accuracy = True
+
+    """
+    Get the splits for the training data.
+    """
+    DS_TRAIN_ORIGINAL_SPLITS = ds_factory_stratified_shuffle_split(
+        ds_train_name, num_train_samples)
+    DS_TEST_ORIGINAL = ds_factory(ds_test_name)
+    assert len(DS_TRAIN_ORIGINAL_SPLITS) >= cv_run_num
+    DS_TRAIN_ORIGINAL_SPLITS = DS_TRAIN_ORIGINAL_SPLITS[:cv_run_num]
+
+    cls_loss_fn = cls_loss_fn_factory(args['cls_loss_fn'])
+
+    """
+    Run over the dataset splits; the splits are fixed for each number of
+    training samples (500,1000,4000, etc.)
+    """
+    for run_i, DS_TRAIN_ORIGINAL in enumerate(DS_TRAIN_ORIGINAL_SPLITS):
+
+        assert len(DS_TRAIN_ORIGINAL) == num_train_samples
+
+        logger.new_run()
+
+        dl_train, DS_TRAIN, DS_TEST, num_classes = setup_data_for_training(
+            # make sure we have randomized training labels
+            ds_train_original=DS_TRAIN_ORIGINAL,
+            ds_test_original=DS_TEST_ORIGINAL,
+            ds_normalization=ds_normalization,
+            type_augmentation=type_augmentation,
+            num_augmentations=num_augmentations,
+            num_intra_samples=num_intra_samples,
+            batch_size=batch_size
+        )
+
+        feat_ext = reader.load_model((run_i + 1) %
+                                     cv_run_num + 1, 'model').feat_ext
+        feat_ext.eval()
+        feat_ext.to(DEVICE)
+        cls = nn.Linear(128, num_classes).to(DEVICE)
+
+        opt = torch.optim.SGD(
+            [
+                {'params': cls.parameters(), 'weight_decay': weight_decay_cls}
+            ],
+            lr=lr_init,
+            momentum=0.9,
+            nesterov=True)
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt,
+            T_max=num_epochs,
+            eta_min=0,
+            last_epoch=-1)
+
+        mb = master_bar(range(num_epochs))
+        mb_comment = ''
+
+        for epoch_i in mb:
+
+            cls.train()
+            epoch_loss = 0
+
+            L = len(dl_train)-1
+            for b_i, ((batch_x, batch_y), _) in enumerate(zip(dl_train, progress_bar(range(L), parent=mb))):
+
+                n = batch_x[0].size(0)
+                assert n == num_intra_samples*num_augmentations
+                assert all(((x.size(0) == n) for x in batch_x))
+
+                x, y = torch.cat(batch_x, dim=0), torch.cat(batch_y, dim=0)
+                x, y = x.to(DEVICE), y.to(DEVICE)
+
+                with torch.no_grad():
+                    z = feat_ext(x)
+                y_hat = cls(z)
+                l_cls = cls_loss_fn(y_hat, y)
+                l = l_cls
+
+                opt.zero_grad()
+                l.backward()
+                opt.step()
+
+                epoch_loss += l.item()
+                logger.log_value('batch_cls_loss', l_cls)
+                logger.log_value('lr', scheduler.get_lr()[0])
+                logger.log_value(
+                    'cls_norm', cls.weight.data.view(-1).norm())
+
+            scheduler.step()
+
+            mb_comment = "Last loss: {:.2f}".format(
+                epoch_loss)
+
+            if track_accuracy:
+
+                model = nn.Sequential(feat_ext, cls)
+
+                X, Y = apply_model(model, DS_TRAIN, device=DEVICE)
+                acc_train = argmax_and_accuracy(X, Y)
+                logger.log_value('acc_train', acc_train)
+                mb_comment += " | acc. train {:.2f} ".format(acc_train)
+
+                X, Y = apply_model(model, DS_TEST, device=DEVICE)
+                acc_test = argmax_and_accuracy(X, Y)
+                logger.log_value('acc_test', acc_test)
+                mb_comment += " | acc. test {:.2f} ".format(acc_test)
+
+                logger.log_value('epoch_i', epoch_i)
+
+                mb.first_bar.comment = mb_comment
+
+            logger.write_logged_values_to_disk()
+
+            if track_model:
+                logger.write_model_to_disk('model_epoch_{}'.format(epoch_i),
+                                           model)
+
+        logger.write_model_to_disk('model', model)
+
+
+def experiment_statreg(
+        output_root_dir=None,
+        cv_run_num=None,
+        ds_train_name=None,
+        ds_test_name=None,
+        ds_normalization=None,
+        num_train_samples=None,
+        num_augmentations=None,
+        type_augmentation=None,
+        num_intra_samples=None,
+        model_name=None,
+        batch_size=None,
+        num_epochs=None,
+        cls_loss_fn=None,
+        statreg_loss_fn=None,
+        w_statreg_loss=None,
+        lr_init=None,
+        weight_decay_cls=None,
+        weight_decay_feat_ext=None,
+        track_model=None,
+        tag=''):
+
+    args = dict(locals())
+    print(args)
+    if not all(((v is not None) for k, v in args.items())):
+        s = ', '.join((k for k, v in args.items() if v is None))
+        raise AssertionError("Some kwargs are None: {}!".format(s))
+
+    exp_id = get_experiment_id(tag)
+    output_dir = Path(output_root_dir) / exp_id
+    output_dir.mkdir()
+
+    logger = ExperimentLogger(output_dir, args)
+
+    track_accuracy = True
+
+    """
+    Get the splits for the training data.
+    """
+    DS_TRAIN_ORIGINAL_SPLITS = ds_factory_stratified_shuffle_split(
+        ds_train_name, num_train_samples)
+    DS_TEST_ORIGINAL = ds_factory(ds_test_name)
+    assert len(DS_TRAIN_ORIGINAL_SPLITS) >= cv_run_num
+    DS_TRAIN_ORIGINAL_SPLITS = DS_TRAIN_ORIGINAL_SPLITS[:cv_run_num]
+
+    cls_loss_fn = cls_loss_fn_factory(args['cls_loss_fn'])
+    statreg_loss_fn = getattr(core.statreg, args['statreg_loss_fn'])
+
+    """
+    Run over the dataset splits; the splits are fixed for each number of
+    training samples (500,1000,4000, etc.)
+    """
+    for run_i, DS_TRAIN_ORIGINAL in enumerate(DS_TRAIN_ORIGINAL_SPLITS):
+
+        assert len(DS_TRAIN_ORIGINAL) == num_train_samples
+
+        logger.new_run()
+
+        dl_train, DS_TRAIN, DS_TEST, num_classes = setup_data_for_training(
+            ds_train_original=DS_TRAIN_ORIGINAL,
+            ds_test_original=DS_TEST_ORIGINAL,
+            ds_normalization=ds_normalization,
+            type_augmentation=type_augmentation,
+            num_augmentations=num_augmentations,
+            num_intra_samples=num_intra_samples,
+            batch_size=batch_size
+        )
+
+        model = model_factory(model_name, num_classes)
+        model = model.to(DEVICE)
+
+        opt = torch.optim.SGD(
+            [
+                {'params': model.feat_ext.parameters(
+                ), 'weight_decay': weight_decay_feat_ext},
+                {'params': model.cls.parameters(), 'weight_decay': weight_decay_cls}
+            ],
+            lr=lr_init,
+            momentum=0.9,
+            nesterov=True)
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt,
+            T_max=num_epochs,
+            eta_min=0,
+            last_epoch=-1)
+
+        mb = master_bar(range(num_epochs))
+        mb_comment = ''
+
+        for epoch_i in mb:
+
+            model.train()
+            epoch_loss = 0
+
+            L = len(dl_train)-1
+            for b_i, ((batch_x, batch_y), _) in enumerate(zip(dl_train, progress_bar(range(L), parent=mb))):
+
+                n = batch_x[0].size(0)
+                assert n == num_intra_samples*num_augmentations
+                assert all(((x.size(0) == n) for x in batch_x))
+
+                x, y = torch.cat(batch_x, dim=0), torch.cat(batch_y, dim=0)
+                x, y = x.to(DEVICE), y.to(DEVICE)
+
+                y_hat, z = model(x)
+                l_cls = cls_loss_fn(y_hat, y) + \
+                    w_statreg_loss * statreg_loss_fn(z, y)
+                l = l_cls
+
+                opt.zero_grad()
+                l.backward()
+                opt.step()
+
+                epoch_loss += l.item()
+                logger.log_value('batch_cls_loss', l_cls)
+                logger.log_value('lr', scheduler.get_lr()[0])
+                logger.log_value(
+                    'cls_norm', model.cls[0].weight.data.view(-1).norm())
+
+            scheduler.step()
+
+            mb_comment = "Last loss: {:.2f}".format(
+                epoch_loss)
+
+            if track_accuracy:
+
+                X, Y = apply_model(model, DS_TRAIN, device=DEVICE)
+                acc_train = argmax_and_accuracy(X, Y)
+                logger.log_value('acc_train', acc_train)
+                mb_comment += " | acc. train {:.2f} ".format(acc_train)
+
+                acc_test = -1
+                if epoch_i == num_epochs-1:
+                    X, Y = apply_model(model, DS_TEST, device=DEVICE)
+                    acc_test = argmax_and_accuracy(X, Y)
+
                 logger.log_value('acc_test', acc_test)
                 mb_comment += " | acc. test {:.2f} ".format(acc_test)
 

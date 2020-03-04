@@ -1,7 +1,7 @@
 import torch
 import torchvision
-
-from collections import defaultdict, OrderedDict
+import numpy as np
+from collections import defaultdict, OrderedDict, Counter
 
 
 def ds_statistics(ds):
@@ -25,8 +25,8 @@ def ds_statistics(ds):
     num_classes = len(set(Y))
 
     return {
-        'channel_mean': mean, 
-        'channel_std': std, 
+        'channel_mean': mean,
+        'channel_std': std,
         'num_classes': num_classes
     }
 
@@ -124,3 +124,24 @@ class IntraLabelMultiDraw(DynamicDatasetWrapper):
 
     def __len__(self):
         return len(self.wrappee)
+
+
+class RandomLabeledDataset(DynamicDatasetWrapper):
+    def __init__(self, wrappee):
+        super().__init__(wrappee)
+
+        Y = [self.wrappee[i][1] for i in range(len(self.wrappee))]
+        tmp = Counter(Y)
+        Y = sum([[k]*v for k, v in tmp.items()], [])
+        self.Y = Y
+
+        tmp = np.array(list(range(len(self.wrappee))))
+        np.random.shuffle(tmp)
+        self.idx_perm = tmp
+
+    def __getitem__(self, idx):
+        x, _ = self.wrappee[idx]
+
+        y = self.Y[self.idx_perm[idx]]
+
+        return x, y
