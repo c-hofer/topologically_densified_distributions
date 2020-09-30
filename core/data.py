@@ -51,23 +51,23 @@ class DatasetFactory():
         return iter(self.ds_name_to_fn_and_kwargs)
 
 
-DATA_ROOT = Path('/scratch1/chofer/data/')
+DATA_ROOT = Path('./data')
 
 DS_PATH_CFG = {
     'cifar10_train':
-        (CIFAR10, {'root': DATA_ROOT / 'cifar10', 'train': True}),
+        (CIFAR10, {'root': DATA_ROOT / 'cifar10', 'train': True, 'download': True}),
     'cifar10_test':
-        (CIFAR10, {'root': DATA_ROOT / 'cifar10', 'train': False}),
+        (CIFAR10, {'root': DATA_ROOT / 'cifar10', 'train': False, 'download': True}),
     'cifar10.1v4':
-        (CIFAR_1_1, {'root': DATA_ROOT / 'CIFAR-10.1'}),
+        (CIFAR_1_1, {'root': DATA_ROOT / 'CIFAR-10.1', 'download': True}),
     'cifar100_train':
-        (CIFAR100, {'root': DATA_ROOT / 'cifar100', 'train': True}),
+        (CIFAR100, {'root': DATA_ROOT / 'cifar100', 'train': True, 'download': True}),
     'cifar100_test':
-        (CIFAR100, {'root': DATA_ROOT / 'cifar100', 'train': False}),
+        (CIFAR100, {'root': DATA_ROOT / 'cifar100', 'train': False, 'download': True}),
     'SVHN_train':
-        (SVHN, {'root': DATA_ROOT / 'SVHN', 'split': 'train'}),
+        (SVHN, {'root': DATA_ROOT / 'SVHN', 'split': 'train', 'download': True}),
     'SVHN_test':
-        (SVHN, {'root': DATA_ROOT / 'SVHN', 'split': 'test'}),
+        (SVHN, {'root': DATA_ROOT / 'SVHN', 'split': 'test', 'download': True}),
     'MNIST_train':
         (MNIST, {'root': DATA_ROOT / 'mnist', 'train' : True, 'download': True}),
     'MNIST_test':
